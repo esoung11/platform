@@ -22,7 +22,7 @@ spec:
         - name: gitlab-registry
       containers:
         - name: ledger-api
-          image: 10.10.20.10:5050/homelab/ledger-api:latest
+          image: 10.10.20.10:5050/homelab/ledger-api:c0935b12
           ports:
             - containerPort: 8000
           resources:
