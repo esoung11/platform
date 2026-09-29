@@ -1,93 +1,132 @@
 # platform
 
+> The GitOps config repo for my self-hosted Kubernetes platform. Argo CD keeps a
+> two-node k3s cluster matching what's in this repo, so **a merge to `main` is the
+> deploy**. Nobody runs `kubectl apply` by hand.
 
+## The problem
+In many teams, what's running in production is whatever someone last applied from
+their laptop or clicked in a console. There's no reliable record of what runs,
+drift goes unnoticed, and rollback means guessing. For regulated companies (for
+example fintechs under the EU's DORA), untraceable change is a compliance problem
+as well as an operational one.
 
-## Getting started
+This repo makes Git the single source of truth: every change to the cluster is a
+reviewed commit, and the cluster corrects itself back to Git if anything drifts.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## What I built
+Everything runs on one always-on mini PC (Proxmox VE), built up in stages:
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- **Segmented network:** an isolated lab network (`10.10.20.0/24`) behind an
+  OPNsense firewall, with no management ports exposed to the internet.
+- **Self-hosted CI/CD:** GitLab CE with a container registry and a runner.
+  Pipelines lint, test and build images tagged with the commit SHA.
+- **Kubernetes:** a two-node k3s cluster (control plane + worker) cloned from a
+  cloud-init VM template.
+- **GitOps:** Argo CD watches this repo with automated sync, `prune` and
+  `selfHeal`.
+- **A real workload:** [`ledger-api`](https://github.com/esoung11/ledger-api), a
+  Flask service running 3 replicas as a non-root user, with health probes,
+  resource limits and a pinned image.
+- **Remote access:** Tailscale subnet router, so the lab is reachable from
+  anywhere without port forwarding (the home connection is double-NAT'd).
+- **Off-site copy:** GitLab push-mirrors `main` to GitHub, using a separate
+  deploy key per repo, scoped to that one repo.
 
-## Add your files
+## Architecture
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```mermaid
+flowchart LR
+  dev["ThinkPad<br/>git · kubectl"] -- "Tailscale" --> gl
+  subgraph lab["Lab network 10.10.20.0/24 (behind OPNsense)"]
+    gl["GitLab CE + Registry"]
+    run["GitLab Runner"]
+    subgraph k3s["k3s cluster"]
+      argo["Argo CD"]
+      app["ledger-api × 3"]
+    end
+  end
+  gl -- "pipeline" --> run
+  run -- "push image :sha" --> gl
+  argo -. "watch this repo" .-> gl
+  argo -. "reconcile" .-> app
+  app -- "pull image" --> gl
+  gl -- "push mirror (main)" --> gh["GitHub"]
 ```
-cd existing_repo
-git remote add origin http://10.10.20.10/homelab/platform.git
-git branch -M main
-git push -uf origin main
+
+Full detail, data flows and trust boundaries: [docs/architecture.md](docs/architecture.md).
+
+## How a change ships
+There are two repos with two kinds of change (see [ADR-0003](docs/adr/0003-manifests-in-config-repo.md)):
+
+1. **App code** (`ledger-api`): push → CI lints, tests and builds → image pushed as
+   `ledger-api:<short-sha>`.
+2. **What runs** (this repo): change the image tag or replicas in
+   `apps/ledger-api/` → merge request → merge to `main` → Argo CD syncs the cluster
+   within a few minutes.
+
+Rolling back is a `git revert` of the manifest change.
+
+## What I've verified
+- Scaling `replicas` 2 → 3 in Git, with no `kubectl`: the cluster followed on its own.
+- Found the cluster running a two-day-old image while `:latest` had moved on
+  (digest `d79aacf` running vs `aaeb96f` published). Pinned the image to its
+  SHA tag, merged, and all pods rolled to `c0935b12`
+  ([ADR-0006](docs/adr/0006-pin-images-by-sha-tag.md)).
+- Scanned the full Git history of every repo with Gitleaks before publishing,
+  plus a search for committed Kubernetes Secrets: clean
+  ([ADR-0008](docs/adr/0008-rewrite-history-to-noreply-identity.md)).
+
+## Repo layout
+```text
+apps/ledger-api/     Deployment + Service for ledger-api (namespace: ledger)
+argocd/              Argo CD Application definitions (Argo's own config, in Git)
+docs/architecture.md Components, data flows, trust boundaries
+docs/adr/            Architecture decision records
 ```
 
-## Integrate with your tools
+## Key decisions
+| ADR | Decision |
+|---|---|
+| [0001](docs/adr/0001-record-architecture-decisions.md) | Record architecture decisions as ADRs |
+| [0002](docs/adr/0002-use-k3s-for-kubernetes.md) | Use k3s as the Kubernetes distribution |
+| [0003](docs/adr/0003-manifests-in-config-repo.md) | Keep manifests in a config repo, separate from app code |
+| [0004](docs/adr/0004-use-argocd-for-gitops.md) | Use Argo CD for GitOps |
+| [0005](docs/adr/0005-use-tailscale-for-remote-access.md) | Use Tailscale for remote access |
+| [0006](docs/adr/0006-pin-images-by-sha-tag.md) | Pin images by SHA tag, not `:latest` |
+| [0007](docs/adr/0007-push-mirror-to-github-with-deploy-keys.md) | Push-mirror to GitHub with per-repo deploy keys |
+| [0008](docs/adr/0008-rewrite-history-to-noreply-identity.md) | Scan and rewrite history before publishing |
 
-* [Set up project integrations](http://10.10.20.10/homelab/platform/-/settings/integrations)
+## Security in the design
+- Network segmentation: the lab has no direct uplink; OPNsense controls all traffic.
+- No exposed management ports; remote access only over Tailscale.
+- Least-privilege credentials: read-only tokens for Argo CD and image pulls; one
+  deploy key per GitHub repo; short-lived CI job tokens in pipelines.
+- Containers run as non-root (`runAsNonRoot`, UID 1000) with resource limits.
+- Git history scanned for secrets; commit identities use a GitHub noreply address.
 
-## Collaborate with your team
+## Things that broke (and the fix)
+- **CI jobs stuck "pending":** the runner was locked to one project. Made it a
+  shared instance runner.
+- **`ImagePullBackOff` on one node:** k3s on the server node was never restarted
+  after adding `registries.yaml`, so it still demanded HTTPS. Restarted k3s.
+- **Argo CD couldn't read the repo:** GitLab deploy tokens were rejected; a project
+  access token worked.
+- **Sudden `403` on push:** git had cached the read-only token and used it to
+  push. Removed it from the credential store.
+- **Argo CD install failed:** a large CRD exceeded the annotation size limit.
+  Fixed with `kubectl apply --server-side`.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Known limitations (honest homelab trade-offs)
+- Single control-plane node: no control-plane high availability.
+- The registry is plain HTTP inside the lab network.
+- CI builds images with privileged Docker-in-Docker (to be replaced with Kaniko).
+- Image tags are bumped in this repo by hand (to be automated).
+- No backups, monitoring or alerting yet.
 
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## What's next
+- Supply-chain security: Kaniko builds, SBOMs, image signing, and Kyverno
+  admission control so only signed images can run.
+- Observability and resilience: Prometheus, Grafana, Loki, SLOs, chaos tests and
+  automated restore drills.
+- Terraform for the homelab, then the same patterns on AWS.
