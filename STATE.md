@@ -41,7 +41,7 @@ See `../CLAUDE.md`. Short: I drive the reasoning, mentor verifies; one step at a
 Privileged DinD runner · plain-HTTP GitLab registry · single k3s control-plane · manual image-tag bumps · AWS IAM user has `AdministratorAccess` (not least-privilege).
 
 ## NEXT — B3
-1. `git init` `aws-infra/` + add the six evidence docs; write the 3 TODO ADRs (my own words).
+1. Add the six evidence docs to aws-infra; write a 3 TODO ADRs (region, remote state, IAM-not-root) in my own words.
 2. Build **EC2 VM + RDS** in Terraform.
 3. Then **healthchecks + routing + logging**; then **break-&-fix** ops drills.
 
